@@ -2,7 +2,7 @@ name: Trading News Bot
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/10 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -16,7 +16,7 @@ concurrency:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 70
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -33,7 +33,7 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
-          LOOP_SECONDS: "270"
+          LOOP_SECONDS: "3300"
         run: python trading_news_bot.py
 
       - name: Save state back to repo
