@@ -188,10 +188,15 @@ def make_summary(entry, title, limit=260):
     raw = entry.get("summary") or entry.get("description") or ""
     if not raw and entry.get("content"):
         raw = entry["content"][0].get("value", "")
-    text = clean_text(raw)
+    return trim_summary(clean_text(raw), title, limit)
+
+
+def trim_summary(text, title, limit=260):
+    """Text ko chhoti, poore-vakya wali summary mein badalta hai ('' agar kaam ka na ho)."""
+    text = (text or "").strip()
     if text.lower().startswith(title.lower()):
         text = text[len(title):].lstrip(" -:.")
-    if len(text) < 30 or text.lower() == title.lower():
+    if len(text) < 40 or text.lower() == title.lower():
         return ""
     sentences = re.split(r"(?<=[.!?])\s+", text)
     out = ""
@@ -230,28 +235,44 @@ def extract_image(entry):
     return None
 
 
-def fetch_og_image(link):
-    """Article page se main image (og:image) nikalta hai - RSS mein image na ho tab."""
+def _fetch_page(link):
+    """Article page ka HTML (shuruaati hissa). Fail ho to None."""
     try:
         r = requests.get(link, timeout=4, headers={"User-Agent": UA}, stream=True)
         if r.status_code != 200:
             return None
-        page = r.raw.read(250_000, decode_content=True).decode("utf-8", "ignore")
+        return r.raw.read(250_000, decode_content=True).decode("utf-8", "ignore")
     except Exception:
         return None
-    for pat in (
-        r'<meta[^>]+property=["\']og:image(?::secure_url)?["\'][^>]+content=["\']([^"\']+)["\']',
-        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
-        r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']',
-    ):
-        m = re.search(pat, page, re.I)
-        if m:
-            url = html.unescape(m.group(1)).strip()
-            if url.startswith("//"):
-                url = "https:" + url
-            if url.startswith("http"):
-                return url
+
+
+def _meta(page, names):
+    """Page ke <meta> tag se content nikalta hai (property ya name dono)."""
+    for n in names:
+        for pat in (
+            rf'<meta[^>]+(?:property|name)=["\']{n}["\'][^>]+content=["\']([^"\']*)["\']',
+            rf'<meta[^>]+content=["\']([^"\']*)["\'][^>]+(?:property|name)=["\']{n}["\']',
+        ):
+            m = re.search(pat, page or "", re.I)
+            if m and m.group(1).strip():
+                return html.unescape(m.group(1)).strip()
     return None
+
+
+def og_image_from(page):
+    url = _meta(page, ["og:image:secure_url", "og:image", "twitter:image"])
+    if url and url.startswith("//"):
+        url = "https:" + url
+    return url if url and url.startswith("http") else None
+
+
+def og_description_from(page):
+    return _meta(page, ["og:description", "description", "twitter:description"])
+
+
+def fetch_og_image(link):
+    """Article page se main image (og:image)."""
+    return og_image_from(_fetch_page(link))
 
 
 def _font(size, bold=True):
@@ -342,8 +363,15 @@ def check_news(state):
             if not assets or sent >= 6:
                 continue
             summary = make_summary(entry, title)
+            image = extract_image(entry)
+            if not summary or not image:
+                # Feed mein summary/image nahi hai to article page se lo (max ~4 sec)
+                page = _fetch_page(link)
+                if page:
+                    image = image or og_image_from(page)
+                    if not summary:
+                        summary = trim_summary(clean_text(og_description_from(page)), title)
             score = score_text(f"{title}. {summary}")
-            image = extract_image(entry) or fetch_og_image(link)
             card = make_card(title, assets, score, source)  # backup image
             send(build_news_message(source, title, summary, assets, score), image, card)
             sent += 1
