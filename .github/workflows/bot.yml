@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 # Ek time pe ek hi run chale, naya run line mein wait kare (cancel na ho)
 concurrency:
@@ -45,3 +46,9 @@ jobs:
           git diff --quiet --cached || git commit -m "update state"
           git pull --rebase --autostash || true
           git push
+
+      - name: Start next run (chain)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run bot.yml --repo "$GITHUB_REPOSITORY" --ref main || true
