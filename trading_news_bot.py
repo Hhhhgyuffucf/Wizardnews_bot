@@ -292,6 +292,26 @@ def _fetch_page(link):
     return None
 
 
+def reader_summary(link):
+    """Site bot ko block kare to free 'reader' service (r.jina.ai) se article text lo."""
+    try:
+        r = requests.get("https://r.jina.ai/" + link, timeout=12,
+                         headers={"Accept": "text/plain", "X-Return-Format": "markdown"})
+        if r.status_code != 200:
+            print(f"reader status {r.status_code}")
+            return ""
+        body = r.text.split("Markdown Content:", 1)[-1]
+        for para in re.split(r"\n\s*\n", body):
+            text = clean_text(re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", para))  # links/images hatao
+            text = re.sub(r"^[#>*\-\s]+", "", text)
+            if len(text) >= 90 and not re.search(
+                    r"cookie|subscribe|newsletter|sign up|privacy|advertis|copyright|all rights", text, re.I):
+                return text
+    except Exception as e:
+        print("reader error:", type(e).__name__)
+    return ""
+
+
 def page_summary_from(page):
     """Page se summary: og/meta description -> JSON-LD description -> pehla lamba paragraph."""
     d = og_description_from(page)
@@ -403,8 +423,9 @@ def quote_line(assets):
         import yfinance as yf
 
         parts = []
-        for name in assets[:2]:
-            ticker = TICKERS.get(name)
+        by_name = {k.split()[-1]: v for k, v in TICKERS.items()}  # "🥇 Gold" -> "Gold"
+        for name in assets[:4]:
+            ticker = by_name.get(name)
             if not ticker:
                 continue
             cached = _QUOTE_CACHE.get(name)
@@ -415,10 +436,10 @@ def quote_line(assets):
             if data.empty:
                 continue
             last, first = float(data["Close"].iloc[-1]), float(data["Close"].iloc[0])
-            text = f"{name} now ${last:,.2f} ({(last - first) / first * 100:+.2f}% today)"
+            text = f"{name} ${last:,.0f} ({(last - first) / first * 100:+.1f}%)"
             _QUOTE_CACHE[name] = (time.time(), text)
             parts.append(text)
-        return "Live: " + " | ".join(parts) if parts else ""
+        return "Live prices: " + " | ".join(parts) if parts else ""
     except Exception:
         return ""
 
@@ -432,6 +453,35 @@ def build_news_message(source, title, summary, assets, score):
         lines.append(f"🎯 {esc(', '.join(assets))}")
     lines.append(f"📰 {esc(source)}")
     return "\n".join(lines)
+
+
+_STOP = set("the a an of to in on for and or as at by with from is are be will after before over amid new says say "
+            "us u s its it this that has have had not but into about up down out more than".split())
+_COMMON = {"bitcoin", "btc", "gold", "silver", "ethereum", "ether", "eth", "price", "prices", "market", "markets"}
+
+
+def title_stems(title):
+    words = re.findall(r"[a-z]+", (title or "").lower())
+    return {w[:5] for w in words if len(w) > 2 and w not in _STOP and w not in _COMMON}
+
+
+def is_duplicate_story(state, title):
+    """Ek hi khabar alag headline se dobara aaye to skip (e.g. Lagarde resigns / to resign)."""
+    mine = title_stems(title)
+    if len(mine) < 2:
+        return False
+    for old in state.get("recent_titles", []):
+        theirs = set(old)
+        shared = len(mine & theirs)
+        if shared >= 2 and shared / min(len(mine), len(theirs)) >= 0.5:
+            return True
+    return False
+
+
+def remember_title(state, title):
+    rt = state.setdefault("recent_titles", [])
+    rt.append(sorted(title_stems(title)))
+    state["recent_titles"] = rt[-60:]
 
 
 def is_old(entry):
@@ -468,6 +518,9 @@ def check_news(state):
             macro = bool(MACRO_RE.search(title))
             if (not assets and not macro) or sent >= 6:
                 continue
+            if is_duplicate_story(state, title):
+                print("duplicate story skipped:", title[:60])
+                continue
             if not assets:
                 assets = list(ALL_ASSETS)
             summary = make_summary(entry, title)
@@ -480,10 +533,13 @@ def check_news(state):
                     if not summary:
                         summary = trim_summary(clean_text(page_summary_from(page)), title)
             if not summary:
+                summary = trim_summary(clean_text(reader_summary(link)), title)
+            if not summary:
                 summary = quote_line(assets)
             score = score_text(f"{title}. {summary}")
             card = make_card(title, assets, score, source)  # backup image
             send(build_news_message(source, title, summary, assets, score), image, card)
+            remember_title(state, title)
             sent += 1
 
 
