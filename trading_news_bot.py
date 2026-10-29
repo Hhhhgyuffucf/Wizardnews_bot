@@ -16,6 +16,7 @@ Kya karta hai:
 Note: Impact (achha/bura) rule-based andaaza hai, financial advice nahi.
 """
 
+import calendar
 import html
 import io
 import json
@@ -55,8 +56,39 @@ NEWS_FEEDS = {
     "Kitco": "https://www.kitco.com/rss/KitcoNews.xml",
     "CoinDesk": "https://www.coindesk.com/arc/outboundfeeds/rss/",
     "CoinTelegraph": "https://cointelegraph.com/rss",
-    "Investing.com": "https://www.investing.com/rss/news_11.rss",
+    "Investing": "https://www.investing.com/rss/news_11.rss",
+    "Investing Economy": "https://www.investing.com/rss/news_14.rss",
+    "Investing Markets": "https://www.investing.com/rss/news_25.rss",
+    "Investing Forex": "https://www.investing.com/rss/news_1.rss",
+    "Federal Reserve": "https://www.federalreserve.gov/feeds/press_all.xml",
+    "CNBC Economy": "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=20910258",
 }
+
+# Bade US macro events ki news (Gold/Silver/Crypto sab hilte hain) - asset ka naam na ho tab bhi
+MACRO_RE = re.compile(
+    r"\b(fomc|federal reserve|the fed|fed (?:holds?|cuts?|hikes?|raises?|keeps?|leaves?|signals?|decision|chair)|"
+    r"powell|interest rates? (?:decision|cut|hike)|rate (?:decision|cut|hike)|"
+    r"cpi|consumer price|inflation (?:data|report|rate|rises|falls|cools|eases|accelerates)|"
+    r"pce|ppi|producer price|nonfarm|non-farm|payrolls|jobs report|unemployment rate|jobless claims|"
+    r"gdp|retail sales|ism (?:manufacturing|services)|treasury yields?|dollar index|"
+    # dollar / yields / central banks
+    r"u\.?s\.? dollar|dollar (?:rises|falls|weakens|strengthens|slides|jumps|index)|bond yields?|10-year yield|"
+    r"central banks?|ecb|bank of japan|boj|bank of england|rate (?:cuts?|hikes?)|recession|stagflation|"
+    # geopolitics / trade / oil
+    r"war|ceasefire|missile|attack|escalat\w*|geopolitic\w*|sanctions?|tariffs?|trade (?:war|deal|talks)|"
+    r"opec|oil prices?|crude|middle east|iran|israel|russia|ukraine|china|taiwan|trump|"
+    # gold / commodity demand
+    r"central bank (?:gold|buying)|gold reserves?|safe[- ]haven|commodit\w*|"
+    # crypto / regulation / institutions
+    r"crypto|stablecoin|spot etf|etf (?:inflows?|outflows?|approval)|sec |cftc|regulat\w*|"
+    r"blockchain|altcoin|defi|binance|coinbase|tether|"
+    # markets / risk
+    r"stocks? (?:fall|plunge|tumble|rally|surge|rebound)|wall street|nasdaq|s&p 500|dow jones|"
+    r"bank (?:collapse|failure|crisis)|debt ceiling|government shutdown|default)\b",
+    re.I,
+)
+ALL_ASSETS = ["Gold", "Silver", "Bitcoin", "Ethereum"]
+MAX_NEWS_AGE_HOURS = 6
 
 EVENTS_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 
@@ -128,9 +160,13 @@ def send(text, image_url=None, card_bytes=None):
     data = {"chat_id": CHAT_ID, "caption": text[:1024], "parse_mode": "HTML"}
     if image_url:
         try:
-            r = requests.post(f"{base}/sendPhoto", data={**data, "photo": image_url}, timeout=10)
+            r = requests.post(f"{base}/sendPhoto", data={**data, "photo": image_url}, timeout=25)
             if r.status_code == 200:
                 return True
+        except requests.exceptions.Timeout:
+            # Telegram ne shayad bhej diya hoga; dobara bhejne se duplicate banta hai
+            print("sendPhoto timeout - assuming delivered")
+            return True
         except Exception:
             pass  # asli image na chali to card try karenge
     if card_bytes:
@@ -237,13 +273,41 @@ def extract_image(entry):
 
 def _fetch_page(link):
     """Article page ka HTML (shuruaati hissa). Fail ho to None."""
-    try:
-        r = requests.get(link, timeout=4, headers={"User-Agent": UA}, stream=True)
-        if r.status_code != 200:
-            return None
-        return r.raw.read(250_000, decode_content=True).decode("utf-8", "ignore")
-    except Exception:
-        return None
+    headers = {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    for _ in range(2):  # ek baar retry
+        try:
+            r = requests.get(link, timeout=7, headers=headers, stream=True)
+            if r.status_code == 200:
+                return r.raw.read(300_000, decode_content=True).decode("utf-8", "ignore")
+            print(f"page fetch status {r.status_code}")
+            if r.status_code in (401, 403, 404):
+                return None
+        except Exception as e:
+            print("page fetch error:", type(e).__name__)
+    return None
+
+
+def page_summary_from(page):
+    """Page se summary: og/meta description -> JSON-LD description -> pehla lamba paragraph."""
+    d = og_description_from(page)
+    if d and len(d) >= 40:
+        return d
+    m = re.search(r'"description"\s*:\s*"((?:[^"\\]|\\.){40,500})"', page or "")
+    if m:
+        try:
+            return json.loads('"' + m.group(1) + '"')
+        except Exception:
+            return m.group(1)
+    for para in re.findall(r"<p[^>]*>(.*?)</p>", page or "", re.S | re.I):
+        text = clean_text(para)
+        if len(text) >= 80 and not re.search(r"cookie|subscribe|newsletter|sign up|privacy", text, re.I):
+            return text
+    return d or ""
 
 
 def _meta(page, names):
@@ -330,6 +394,35 @@ def make_card(title, assets, score, source):
         return None
 
 
+_QUOTE_CACHE = {}
+
+
+def quote_line(assets):
+    """Summary na mile to related asset ka live price dikhao (kaam ki jaankari)."""
+    try:
+        import yfinance as yf
+
+        parts = []
+        for name in assets[:2]:
+            ticker = TICKERS.get(name)
+            if not ticker:
+                continue
+            cached = _QUOTE_CACHE.get(name)
+            if cached and time.time() - cached[0] < 120:
+                parts.append(cached[1])
+                continue
+            data = yf.Ticker(ticker).history(period="1d", interval="5m")
+            if data.empty:
+                continue
+            last, first = float(data["Close"].iloc[-1]), float(data["Close"].iloc[0])
+            text = f"{name} now ${last:,.2f} ({(last - first) / first * 100:+.2f}% today)"
+            _QUOTE_CACHE[name] = (time.time(), text)
+            parts.append(text)
+        return "Live: " + " | ".join(parts) if parts else ""
+    except Exception:
+        return ""
+
+
 def build_news_message(source, title, summary, assets, score):
     lines = [f"🚨 <b>{esc(title)}</b>"]
     if summary:
@@ -339,6 +432,18 @@ def build_news_message(source, title, summary, assets, score):
         lines.append(f"🎯 {esc(', '.join(assets))}")
     lines.append(f"📰 {esc(source)}")
     return "\n".join(lines)
+
+
+def is_old(entry):
+    """Feed mein purani news (naye feed add hone par) spam na bane."""
+    t = entry.get("published_parsed") or entry.get("updated_parsed")
+    if not t:
+        return False
+    try:
+        age = time.time() - calendar.timegm(t)
+        return age > MAX_NEWS_AGE_HOURS * 3600
+    except Exception:
+        return False
 
 
 def check_news(state):
@@ -357,11 +462,14 @@ def check_news(state):
                 continue
             seen.add(link)
             state["seen_links"].append(link)
-            if bootstrap:
+            if bootstrap or is_old(entry):
                 continue
             assets = detect_assets(title)
-            if not assets or sent >= 6:
+            macro = bool(MACRO_RE.search(title))
+            if (not assets and not macro) or sent >= 6:
                 continue
+            if not assets:
+                assets = list(ALL_ASSETS)
             summary = make_summary(entry, title)
             image = extract_image(entry)
             if not summary or not image:
@@ -370,7 +478,9 @@ def check_news(state):
                 if page:
                     image = image or og_image_from(page)
                     if not summary:
-                        summary = trim_summary(clean_text(og_description_from(page)), title)
+                        summary = trim_summary(clean_text(page_summary_from(page)), title)
+            if not summary:
+                summary = quote_line(assets)
             score = score_text(f"{title}. {summary}")
             card = make_card(title, assets, score, source)  # backup image
             send(build_news_message(source, title, summary, assets, score), image, card)
@@ -510,11 +620,17 @@ def check_events(state, now, events=None):
                 else:
                     inv = any(w in title.lower() for w in INVERSE_EVENT_WORDS)
                     up, down = ("lower", "higher") if inv else ("higher", "lower")
-                    msg = (f"🔔 <b>Event out now: {esc(title)}</b>\n"
-                           f"{details}\n\n"
-                           f"I'll send the result as soon as it is available. General rule:\n"
-                           f"• Actual {up} than forecast → 🔴 pressure on Gold/Crypto\n"
-                           f"• Actual {down} than forecast → 🟢 support for Gold/Crypto")
+                    if ev.get("forecast"):
+                        msg = (f"🔔 <b>Event out now: {esc(title)}</b>\n"
+                               f"{details}\n\n"
+                               f"I'll send the result as soon as it is available. General rule:\n"
+                               f"• Actual {up} than forecast → 🔴 pressure on Gold/Crypto\n"
+                               f"• Actual {down} than forecast → 🟢 support for Gold/Crypto")
+                    else:
+                        msg = (f"🔔 <b>Event out now: {esc(title)}</b>\n"
+                               f"{details}\n\n"
+                               f"No number to compare. I'm watching the news feeds and will post "
+                               f"what was said and the market impact as soon as it is published.")
                     send(msg)
 
             # --- baad mein result aaye to ---
