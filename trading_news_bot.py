@@ -17,6 +17,7 @@ Note: Impact (achha/bura) rule-based andaaza hai, financial advice nahi.
 """
 
 import calendar
+import socket
 import html
 import io
 import json
@@ -36,7 +37,8 @@ DRY_RUN = os.environ.get("DRY_RUN") == "1" or not BOT_TOKEN or not CHAT_ID
 
 STATE_FILE = os.environ.get("STATE_FILE", "bot_state.json")
 LOOP_SECONDS = int(os.environ.get("LOOP_SECONDS", "270"))
-POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "45"))
+POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "20"))
+socket.setdefaulttimeout(15)  # koi feed atke nahi
 
 PRICE_EVERY_MIN = 30
 EVENT_STAGES = [300, 60, 15, 5, 1]  # minute pehle
@@ -58,35 +60,46 @@ NEWS_FEEDS = {
     "CoinTelegraph": "https://cointelegraph.com/rss",
     "Investing": "https://www.investing.com/rss/news_11.rss",
     "Investing Economy": "https://www.investing.com/rss/news_14.rss",
-    "Investing Markets": "https://www.investing.com/rss/news_25.rss",
-    "Investing Forex": "https://www.investing.com/rss/news_1.rss",
     "Federal Reserve": "https://www.federalreserve.gov/feeds/press_all.xml",
     "CNBC Economy": "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=20910258",
 }
 
 # Bade US macro events ki news (Gold/Silver/Crypto sab hilte hain) - asset ka naam na ho tab bhi
 MACRO_RE = re.compile(
-    r"\b(fomc|federal reserve|the fed|fed (?:holds?|cuts?|hikes?|raises?|keeps?|leaves?|signals?|decision|chair)|"
-    r"powell|interest rates? (?:decision|cut|hike)|rate (?:decision|cut|hike)|"
-    r"cpi|consumer price|inflation (?:data|report|rate|rises|falls|cools|eases|accelerates)|"
-    r"pce|ppi|producer price|nonfarm|non-farm|payrolls|jobs report|unemployment rate|jobless claims|"
-    r"gdp|retail sales|ism (?:manufacturing|services)|treasury yields?|dollar index|"
-    # dollar / yields / central banks
-    r"u\.?s\.? dollar|dollar (?:rises|falls|weakens|strengthens|slides|jumps|index)|bond yields?|10-year yield|"
-    r"central banks?|ecb|bank of japan|boj|bank of england|rate (?:cuts?|hikes?)|recession|stagflation|"
-    # geopolitics / trade / oil
-    r"war|ceasefire|missile|attack|escalat\w*|geopolitic\w*|sanctions?|tariffs?|trade (?:war|deal|talks)|"
-    r"opec|oil prices?|crude|middle east|iran|israel|russia|ukraine|china|taiwan|trump|"
-    # gold / commodity demand
-    r"central bank (?:gold|buying)|gold reserves?|safe[- ]haven|commodit\w*|"
-    # crypto / regulation / institutions
-    r"crypto|stablecoin|spot etf|etf (?:inflows?|outflows?|approval)|sec |cftc|regulat\w*|"
-    r"blockchain|altcoin|defi|binance|coinbase|tether|"
-    # markets / risk
-    r"stocks? (?:fall|plunge|tumble|rally|surge|rebound)|wall street|nasdaq|s&p 500|dow jones|"
-    r"bank (?:collapse|failure|crisis)|debt ceiling|government shutdown|default)\b",
+    r"\b(fomc|federal reserve|powell|fed (?:holds?|cuts?|hikes?|raises?|keeps?|leaves?|decision|chair)|"
+    r"(?:interest )?rate (?:decision|cuts?|hikes?)|"
+    r"cpi|consumer price|inflation (?:data|report)|pce|ppi|producer price|"
+    r"nonfarm|non-farm|payrolls|jobs report|unemployment rate|"
+    r"gdp|ecb (?:holds?|cuts?|hikes?|decision)|bank of japan|bank of england|"
+    r"tariffs?|spot etf|etf (?:approval|approved)|sec (?:approves|sues|charges|lawsuit)|"
+    r"strategic (?:bitcoin|crypto) reserve|bank collapse|bank failure|debt ceiling|government shutdown)\b",
     re.I,
 )
+# Sirf kaam ki / badi news: faltu (opinion, analysis, live blog) hatao
+JUNK_RE = re.compile(
+    r"\b(live updates?|live blog|price analysis|price prediction|price forecast|technical analysis|opinion|"
+    r"podcast|newsletter|explained|explainer|how to|what is|guide|review|sponsored|week ahead|"
+    r"things to know|what to know|top \d+|\d+ (?:things|reasons|ways)|quiz|weekly (?:recap|wrap)|"
+    r"could|might|may (?:hit|reach|rise|fall)|why )\b",
+    re.I,
+)
+IMPORTANT_RE = re.compile(
+    r"\b(record|all-time|billion|\$\d[\d,.]*\s?(?:million|billion|m|b|bn)\b|etfs?|sec|court|cftc|hack\w*|exploit\w*|"
+    r"ban\w*|approv\w*|lawsuit|whale|liquidat\w*|crash\w*|surg\w*|plung\w*|soar\w*|halving|reserve|"
+    r"treasury|fed|fomc|cpi|tariff\w*|rate (?:cut|hike)|buys?|sells?|acquir\w*|bankrupt\w*|"
+    r"above \$\d|below \$\d|breaks?|tops?|hits?)\b",
+    re.I,
+)
+MAX_NEWS_PER_ROUND = 12   # important news rokni nahi hai
+MAX_MACRO_PER_ROUND = 4
+
+
+def is_important(title):
+    if JUNK_RE.search(title or ""):
+        return False
+    return bool(IMPORTANT_RE.search(title or "")) or abs(score_text(title)) >= 1
+
+
 ALL_ASSETS = ["Gold", "Silver", "Bitcoin", "Ethereum"]
 MAX_NEWS_AGE_HOURS = 6
 
@@ -279,9 +292,9 @@ def _fetch_page(link):
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
     }
-    for _ in range(2):  # ek baar retry
+    for _ in range(1):
         try:
-            r = requests.get(link, timeout=7, headers=headers, stream=True)
+            r = requests.get(link, timeout=5, headers=headers, stream=True)
             if r.status_code == 200:
                 return r.raw.read(300_000, decode_content=True).decode("utf-8", "ignore")
             print(f"page fetch status {r.status_code}")
@@ -295,7 +308,7 @@ def _fetch_page(link):
 def reader_summary(link):
     """Site bot ko block kare to free 'reader' service (r.jina.ai) se article text lo."""
     try:
-        r = requests.get("https://r.jina.ai/" + link, timeout=12,
+        r = requests.get("https://r.jina.ai/" + link, timeout=7,
                          headers={"Accept": "text/plain", "X-Return-Format": "markdown"})
         if r.status_code != 200:
             print(f"reader status {r.status_code}")
@@ -496,16 +509,30 @@ def is_old(entry):
         return False
 
 
+def fetch_all_feeds():
+    """Saari feeds ek saath (parallel) - isse news jaldi pakdi jaati hai."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(item):
+        name, url = item
+        try:
+            return name, feedparser.parse(url, agent=UA)
+        except Exception as e:
+            print(f"Feed error {name}: {type(e).__name__}")
+            return name, None
+
+    with ThreadPoolExecutor(max_workers=len(NEWS_FEEDS)) as ex:
+        results = list(ex.map(one, NEWS_FEEDS.items()))
+    return {n: f for n, f in results if f is not None}
+
+
 def check_news(state):
     seen = set(state["seen_links"])
     bootstrap = not seen  # pehli baar: purani news spam na ho
     sent = 0
-    for source, url in NEWS_FEEDS.items():
-        try:
-            feed = feedparser.parse(url, agent=UA)
-        except Exception as e:
-            print(f"Feed error {source}: {type(e).__name__}")
-            continue
+    macro_sent = 0
+    feeds = fetch_all_feeds()
+    for source, feed in feeds.items():
         for entry in list(feed.entries)[:20]:
             link, title = entry.get("link"), (entry.get("title") or "").strip()
             if not link or not title or link in seen:
@@ -516,13 +543,19 @@ def check_news(state):
                 continue
             assets = detect_assets(title)
             macro = bool(MACRO_RE.search(title))
-            if (not assets and not macro) or sent >= 6:
+            if (not assets and not macro) or sent >= MAX_NEWS_PER_ROUND:
+                continue
+            if not is_important(title):
+                print("low-value news skipped:", title[:60])
+                continue
+            if not assets and macro_sent >= MAX_MACRO_PER_ROUND:
                 continue
             if is_duplicate_story(state, title):
                 print("duplicate story skipped:", title[:60])
                 continue
             if not assets:
                 assets = list(ALL_ASSETS)
+                macro_sent += 1
             summary = make_summary(entry, title)
             image = extract_image(entry)
             if not summary or not image:
@@ -544,6 +577,21 @@ def check_news(state):
 
 
 # ---------------- PRICE ----------------
+def trend_30m(closes, threshold=0.1):
+    """Pichle 30 min ka trend (5-min candles, 6 bars). (label, emoji, pct30)"""
+    closes = [float(c) for c in closes if c == c]
+    if len(closes) < 3:
+        return "Sideways", "➡️", None
+    last = closes[-1]
+    base = closes[-7] if len(closes) >= 7 else closes[0]
+    pct = (last - base) / base * 100
+    if pct > threshold:
+        return "Bullish", "📈", pct
+    if pct < -threshold:
+        return "Bearish", "📉", pct
+    return "Sideways", "➡️", pct
+
+
 def get_prices():
     import yfinance as yf
 
@@ -558,6 +606,14 @@ def get_prices():
             pct = (last - first) / first * 100
             arrow = "🟢" if last >= first else "🔴"
             lines.append(f"{name}: ${last:,.2f}  {arrow} {pct:+.2f}%")
+            try:
+                closes = list(data["Close"])
+            except Exception:
+                closes = []
+            crypto = ("Bitcoin" in name) or ("Ethereum" in name)
+            label, emo, p30 = trend_30m(closes, 0.2 if crypto else 0.08)
+            extra = f" (30 min {p30:+.2f}%)" if p30 is not None else ""
+            lines.append(f"      {emo} {label}{extra}")
         except Exception as e:
             lines.append(f"{name}: error ({type(e).__name__})")
     return "\n".join(lines)
